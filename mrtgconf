@@ -1,0 +1,42 @@
+#!/usr/bin/perl
+
+use DBI;
+use DBD::mysql;
+
+
+
+use Cwd 'abs_path';
+
+$cwd = abs_path(__FILE__);
+@find = split('/',$cwd);
+splice @find,-2;
+push (@find,'db.conf');
+$rpl=join('/',@find);
+require $rpl;
+
+$query = "select * from DEVICES";
+
+#connecting to database 
+$dbh = DBI->connect("DBI:mysql:$database:$host",$username,$password);
+$sqlQuery =$dbh->prepare($query) or die "Can't prepare $query: $dbh->errstr\n";
+$sqlQuery->execute() or die "can't execute the query: $sqlQuery->errstr";
+
+my @IP = ();
+
+while (@row=$sqlQuery->fetchrow())
+  {
+   ($id,$IP,$PORT,$COMMUNITY) = @row;
+   #print "$IP,$PORT,$COMMUNITY";
+ 
+  push @IP,$COMMUNITY."@".$IP.":".$PORT;
+
+   
+  }
+print "@IP\n";
+
+system("cfgmaker --output /etc/mrtg/mrtg.cfg  --global \"WorkDir: /var/www/mrtg\" --global \"options[_]: growright,bits\" --global \"RunAsDaemon: Yes\" @IP ");
+   
+system("indexmaker --output=/var/www/mrtg/index.html /etc/mrtg/mrtg.cfg");
+   
+   
+system("env LANG=C /usr/bin/mrtg /etc/mrtg/mrtg.cfg");
