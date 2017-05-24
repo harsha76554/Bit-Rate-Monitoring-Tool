@@ -1,0 +1,313 @@
+#!/usr/bin/perl
+
+use Net::SNMP;
+use DBI;
+use DBD::mysql;
+use RRD::Simple ();
+use Data::Dumper qw(Dumper);
+
+use Cwd 'abs_path';
+
+$cwd = abs_path(__FILE__);
+@find = split('/',$cwd);
+splice @find,-2;
+push (@find,'db.conf');
+$rpl=join('/',@find);
+require $rpl;
+
+$query = "select * from DEVICES";
+
+my $ifIndex = '1.3.6.1.2.1.2.2.1.1';
+my $OID_sysname = '1.3.6.1.2.1.1.5.0';
+my $OID_sysContact = '1.3.6.1.2.1.1.4.0';
+my $OID_sysLocation = '1.3.6.1.2.1.1.6.0';
+my $ifType = '1.3.6.1.2.1.2.2.1.3.';
+my $ifSpeed = '1.3.6.1.2.1.2.2.1.5.';
+my $ifOperStatus = '1.3.6.1.2.1.2.2.1.8.';
+my $ifInOctets = '1.3.6.1.2.1.2.2.1.10.';
+my $ifOutOctets = '1.3.6.1.2.1.2.2.1.16.';
+
+
+
+
+
+my %dinfo;
+#connecting to database 
+$dbh = DBI->connect("DBI:mysql:$database:$host",$username,$password);
+$sqlQuery =$dbh->prepare($query) or die "Can't prepare $query: $dbh->errstr\n";
+$sqlQuery->execute() or die "can't execute the query: $sqlQuery->errstr";
+$hash_ref = $sqlQuery->fetchall_hashref('id');
+
+#create if table not exist
+
+my $table= "CREATE TABLE IF NOT EXISTS harsha(
+id INT(30) not null primary key auto_increment,
+IP varchar(30) NOT NULL,
+COMMUNITY varchar(255) NOT NULL,
+PORT INT(10) NOT NULL,
+filteredint varchar(255) NOT NULL,
+sysContact varchar(255) NOT NULL,
+sysLocation varchar(255) NOT NULL,
+sysName varchar(255) NOT NULL,UNIQUE key(IP,COMMUNITY,PORT)) " ;
+
+$sqltable=$dbh->prepare($table) or die "Can't create $table:$dbh->errstr\n";
+ $sqltable->execute() or die "can't execute create table: $sqltable->errstr";
+
+
+for my $f(keys($hash_ref)) 
+  {
+
+  my $id = $hash_ref->{$f}{'id'};
+  my $IP = $hash_ref->{$f}{'IP'};
+  my $PORT = $hash_ref->{$f}{'PORT'};
+  my $COMMUNITY = $hash_ref->{$f}{'COMMUNITY'};
+   
+ #  print "$id,$IP,$COMMUNITY,$PORT";
+
+my $update=$dbh->prepare("insert ignore into harsha (IP,PORT,COMMUNITY) values ('$IP','$PORT','$COMMUNITY')");
+   $update->execute();
+   $update->finish();
+
+
+  #creating net-snmp session
+($session,$error) = Net::SNMP->session(
+     -hostname => $IP,
+   -community   => $COMMUNITY,
+   -port        =>  $PORT,
+   -nonblocking => 1,
+   
+);
+
+if (!defined($session)) {
+    printf ("ERROR from session: %s.\n",$error);
+    exit 1;
+
+}
+  
+if (!defined($session->get_table(-baseoid => $ifIndex,
+                                 -callback => [\&Int_index,$IP,$COMMUNITY,$PORT])))
+{
+printf ("ERROR from get table: %s.\n",$session->error());
+}
+
+#for sysname
+
+
+#sending get request to snmp host
+my $nameh = $session-> get_request(
+        -varbindlist => [$OID_sysname,$OID_sysContact,$OID_sysLocation],
+        -callback => [\&get_name,$IP,$COMMUNITY,$PORT],
+);
+
+
+
+
+}#exit main while
+
+
+snmp_dispatcher();
+
+sub get_name
+{
+ my ($session, $IP, $COMMUNITY, $PORT)=@_;
+ my $result = $session->var_bind_list();
+ 
+ if (!defined $result){
+ printf "ERROR:request for name failed for host '%s' \n",
+      $session->hostname(),$session->error();
+    return;
+     }
+    my $update2 = $dbh-> prepare("update harsha set sysName='$result->{$OID_sysname}', sysContact='$result->{$OID_sysContact}',sysLocation='$result->{$OID_sysLocation}'  where IP='$IP' AND COMMUNITY='$COMMUNITY' AND PORT='$PORT' ");
+      $update2->execute();
+      $update2->finish();
+}
+
+
+sub Int_index
+{
+my @v=();
+ my ($session,$IP,$COMMUNITY,$PORT) = @_;
+ if (!defined($session->var_bind_list())) {
+      printf("ERROR from call back1: %s.\n", $session->error());
+   } else {
+      
+      foreach (keys(%{$session->var_bind_list()})) {
+        push @v,$session->var_bind_list()->{$_};
+        push @{$dinfo {$IP."/".$COMMUNITY."/".$PORT}{interfaces}},$session->var_bind_list()->{$_};
+        }
+
+
+
+my @oid=();
+      foreach (@v){
+        
+             my $oidType = $ifType."$_";
+             my $oidSpeed = $ifSpeed."$_";
+             my $oidOperStatus = $ifOperStatus."$_";
+             
+             push @oid,$oidType,$oidSpeed,$oidOperStatus;
+             #print "@oid\n";
+             }
+
+
+     while (@oid){
+                   my @soid = splice @oid,0,40;
+       
+                  my $result = $session-> get_request(
+        -varbindlist => [@soid],
+        -callback => [\&get_callback,$IP,$COMMUNITY,$PORT],
+);
+
+
+if (!defined $result) {
+   printf "ERROR from call back 11: Failed to send get request for host",
+      $session->hostname(),$session->error();
+}
+}#exit while loop
+}
+
+snmp_dispatcher();
+}#exit main callback
+sub get_callback
+   { 
+      my ($session,$IP,$COMMUNITY,$PORT) = @_;
+
+      #print Dumper $session;
+      my $result1 = $session->var_bind_list();
+      if (!defined $result1) {
+         printf "ERROR from callback 2 $COMMUNITY : Get request failed for host '%s': %s.\n",
+                $session->hostname(), $session->error();
+         return;
+      }
+    foreach (keys ($session->var_bind_list()) ){
+    #print "$_","--$result1->{$_}\n";
+     $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'Type/Speed/Operstatus'}{$_}=$result1->{$_};
+   
+     
+    }
+   $dinfo{$IP."/".$COMMUNITY."/".$PORT}{session}=$session;
+     
+}#exit callback 2
+#print $f;
+for my $f(keys($hash_ref)) 
+  {
+  my $id = $hash_ref->{$f}{'id'};
+  my $IP = $hash_ref->{$f}{'IP'};
+  my $PORT = $hash_ref->{$f}{'PORT'};
+  my $COMMUNITY = $hash_ref->{$f}{'COMMUNITY'};
+my @satisfied=();
+   my @k = @{$dinfo {$IP."/".$COMMUNITY."/".$PORT}{interfaces}};
+   my @newint=();
+       $session =  $dinfo{$IP."/".$COMMUNITY."/".$PORT}{session};    
+
+ foreach (@k){
+                       
+               $a = $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'Type/Speed/Operstatus'}{$ifType.$_};
+               $b = $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'Type/Speed/Operstatus'}{$ifSpeed.$_};
+               $c = $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'Type/Speed/Operstatus'}{$ifOperStatus.$_};
+                 if (($a != 24) && ($b != 0) && ($c == 1)){
+             
+                         
+                           my $IfIN = $ifInOctets.$_;
+                           my $IfOut = $ifOutOctets.$_;
+                            push @newint,$_;   
+                            push @satisfied,$IfIN,$IfOut;
+                           
+                  }
+                  
+             }
+          my $ud= join (',',@newint);
+           my $update=$dbh->prepare("update harsha set filteredint='$ud' where IP='$IP' AND COMMUNITY='$COMMUNITY' AND PORT='$PORT' ");
+   $update->execute();
+   $update->finish();
+            
+push @{$dinfo {$IP."/".$COMMUNITY."/".$PORT}{filtered}},@newint;
+#print "@newint\n";
+ if ($#newint<1){
+       delete $dinfo{$IP."/".$COMMUNITY."/".$PORT};
+        
+ }else{
+ while(@satisfied){
+                    my @sat1 = splice @satisfied,0,40;
+#sending get rquest or ifInOctets and ifOutOctets
+
+ my $result2 = $session->get_request(
+        -varbindlist => [@sat1],
+        -callback => [\&getINOUT,$IP,$COMMUNITY,$PORT,@newint],
+);
+
+
+if (!defined $result2) {
+   printf "ERROR from in out: Failed to send get request for host",
+      $session->hostname(),$session->error();
+}
+}
+}
+}#exit while loop
+
+snmp_dispatcher();
+
+sub getINOUT
+   { 
+      my ($session,$IP,$COMMUNITY,$PORT,@newint) = @_;
+
+      
+      my $result3 = $session->var_bind_list();
+      if (!defined $result3) {
+         printf "ERROR call back 3: Get request failed for host '%s': %s.\n",
+                $session->hostname(), $session->error();
+         return;
+      }
+    #print Dumper $result3;
+      foreach (keys ($session->var_bind_list()) ){
+    #print "$_","--$result1->{$_}\n";
+     $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'IFIN/IFOUT'}{$_}=$result3->{$_};
+   
+
+    }
+   
+}
+ #print Dumper \%dinfo;
+foreach (keys(%dinfo)){
+ 
+        my ($IP,$COMMUNITY,$PORT) = split "/",$_;
+
+
+             #create a rrd interface
+$rrdfile = "$IP-$COMMUNITY-$PORT.rrd";
+my $rrd = RRD::Simple->new( file  => $rrdfile,
+                            cf => [ qw(AVERAGE MAX)],
+                            );
+
+my @bytesarray = ();
+#print Dumper @{$dinfo{$IP."/".$COMMUNITY."/".$PORT}{filtered}};
+ foreach (@{$dinfo{$IP."/".$COMMUNITY."/".$PORT}{filtered}}){
+                                     
+                   push @bytesarray,("bytesIn$_"=>"COUNTER"),("bytesOut$_"=>"COUNTER");   
+                   #print Dumper @bytesarray;
+                   }    
+
+ 
+
+ unless (-f $rrdfile) {
+                         
+                         $rrd->create($rrdfile,"mrtg",@bytesarray);                         
+                         
+                         }
+my @update = ();
+#update rrd 
+      foreach (@{$dinfo{$IP."/".$COMMUNITY."/".$PORT}{filtered}}){
+                 my $IfIN = $ifInOctets.$_;
+                 my $IfOut = $ifOutOctets.$_;
+                 my $h = $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'IFIN/IFOUT'}{$IfIN};
+                 my $j = $dinfo{$IP."/".$COMMUNITY."/".$PORT}{'IFIN/IFOUT'}{$IfOut};
+                  #print "$_ \n";             
+                  push @update,("bytesIn$_"=>$h),("bytesOut$_"=>$j);                                                
+                  }     
+                  
+             
+ $rrd->update($rrdfile,@update);   
+ 
+   
+
+}
